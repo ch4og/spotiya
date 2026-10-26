@@ -894,6 +894,8 @@ mod tests {
     }
     #[test]
     fn uninstall_stops_orphaned_helpers_only_from_its_own_directory() {
+        use std::os::unix::process::ExitStatusExt;
+
         let temp = Temporary::new(&std::env::temp_dir(), "spotiya-uninstall-process-test").unwrap();
         let base = temp.0.join("installed");
         fs::create_dir(&base).unwrap();
@@ -911,14 +913,26 @@ mod tests {
         let mut child = Command::new(helper).arg("30").spawn().unwrap();
         let mut other = Command::new("/bin/sleep").arg("30").spawn().unwrap();
         let result = stop_remaining_processes(&base);
-        let child_exited = child.try_wait().unwrap().is_some();
+        // /proc/PID/exe can disappear before the kernel makes the exit status waitable.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let child_status = loop {
+            let status = child.try_wait().unwrap();
+            if status.is_some() || Instant::now() >= deadline {
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
         let other_running = other.try_wait().unwrap().is_none();
         let _ = child.kill();
         let _ = child.wait();
         let _ = other.kill();
         let _ = other.wait();
         result.unwrap();
-        assert!(child_exited && other_running);
+        assert!(
+            child_status.is_some_and(|s| s.signal() == Some(libc::SIGTERM)),
+            "managed helper did not exit from SIGTERM: {child_status:?}"
+        );
+        assert!(other_running, "unrelated process was stopped");
     }
     #[test]
     fn failed_start_restores_binary_scripts_and_profiles_and_recovers() {
