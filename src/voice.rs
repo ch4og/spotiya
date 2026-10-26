@@ -21,6 +21,7 @@ pub enum Intent {
     Voice(bool),
     Spectrum(bool),
     Airplay(bool),
+    Youtube(bool),
     Release,
     Retry,
 }

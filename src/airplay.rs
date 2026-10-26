@@ -23,6 +23,20 @@ pub struct Gate {
     spotify_closed: Notify,
     pid: Mutex<u32>,
     preempted: AtomicBool,
+    /// When the active external source is the YouTube add-on, the path of its
+    /// control socket. Reclaiming then asks it to drain instead of killing it,
+    /// because SIGKILLing an ALSA dmix client mid-write wedges the shared mixer.
+    youtube: Mutex<Option<PathBuf>>,
+    /// The YouTube add-on paused its track but keeps the speaker.
+    youtube_paused: AtomicBool,
+    /// Last reported position of the YouTube track, counted on while it plays.
+    youtube_progress: Mutex<Option<Progress>>,
+}
+#[derive(Clone, Copy)]
+struct Progress {
+    position_ms: u64,
+    at: std::time::Instant,
+    duration_ms: u32,
 }
 impl Gate {
     pub fn new() -> Self {
@@ -32,7 +46,61 @@ impl Gate {
             spotify_closed: Notify::new(),
             pid: Mutex::new(0),
             preempted: AtomicBool::new(false),
+            youtube: Mutex::new(None),
+            youtube_paused: AtomicBool::new(false),
+            youtube_progress: Mutex::new(None),
         }
+    }
+    /// Marks the YouTube add-on as the external source owning the speaker.
+    pub fn hold_youtube(&self, control: PathBuf) {
+        *self.youtube.lock().expect("gate youtube lock") = Some(control);
+        self.youtube_paused.store(false, Ordering::Release);
+        *self.youtube_progress.lock().expect("gate progress lock") = None;
+        self.active.store(true, Ordering::Release);
+    }
+    pub fn release_youtube(&self) {
+        let mut youtube = self.youtube.lock().expect("gate youtube lock");
+        if youtube.take().is_some() {
+            *self.youtube_progress.lock().expect("gate progress lock") = None;
+            self.active.store(false, Ordering::Release);
+        }
+    }
+    pub fn holds_youtube(&self) -> bool {
+        self.youtube.lock().expect("gate youtube lock").is_some()
+    }
+    pub fn set_youtube_paused(&self, paused: bool) {
+        // Re-anchor so a pause freezes the bar where it is and a resume counts on from there.
+        let position = self.youtube_position();
+        let mut progress = self.youtube_progress.lock().expect("gate progress lock");
+        if let (Some(p), Some((position, _))) = (progress.as_mut(), position) {
+            p.position_ms = u64::from(position);
+            p.at = std::time::Instant::now();
+        }
+        self.youtube_paused.store(paused, Ordering::Release);
+    }
+    pub fn set_youtube_progress(&self, position_ms: u64, duration_ms: u32) {
+        *self.youtube_progress.lock().expect("gate progress lock") = Some(Progress {
+            position_ms,
+            at: std::time::Instant::now(),
+            duration_ms,
+        });
+    }
+    /// (position, duration) of the YouTube track in ms, as of now.
+    pub fn youtube_position(&self) -> Option<(u32, u32)> {
+        let progress = (*self.youtube_progress.lock().expect("gate progress lock"))?;
+        let elapsed = if self.youtube_paused.load(Ordering::Acquire) {
+            0
+        } else {
+            progress.at.elapsed().as_millis() as u64
+        };
+        let position = progress.position_ms.saturating_add(elapsed);
+        Some((
+            position.min(u64::from(progress.duration_ms)) as u32,
+            progress.duration_ms,
+        ))
+    }
+    pub fn youtube_paused(&self) -> bool {
+        self.holds_youtube() && self.youtube_paused.load(Ordering::Acquire)
     }
     pub fn close_spotify(&self) {
         self.spotify_open.store(false, Ordering::Release);
@@ -55,6 +123,28 @@ impl Gate {
     pub fn reclaim(&self) -> io::Result<()> {
         if !self.active.load(Ordering::Acquire) {
             return Ok(());
+        }
+        // The YouTube add-on drains its own device on request; never SIGKILL it.
+        let youtube = self.youtube.lock().expect("gate youtube lock").clone();
+        if let Some(control) = youtube {
+            if let Ok(mut socket) = std::os::unix::net::UnixStream::connect(&control) {
+                let _ = socket.set_write_timeout(Some(Duration::from_millis(500)));
+                use std::io::Write;
+                let _ = writeln!(socket, "STOP");
+            }
+            // Wait for the add-on to report it released the speaker (clears active).
+            let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+            while std::time::Instant::now() < deadline {
+                if !self.active.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            return if self.active.load(Ordering::Acquire) {
+                Err(io::Error::other("YouTube output did not release"))
+            } else {
+                Ok(())
+            };
         }
         let locked = self
             .pid
@@ -385,7 +475,9 @@ impl Runtime {
         }
         self.children.clear();
         *gate.pid.lock().expect("AirPlay process lock") = 0;
-        gate.active.store(false, Ordering::Release);
+        if !gate.holds_youtube() {
+            gate.active.store(false, Ordering::Release);
+        }
     }
     pub async fn poll(&mut self, gate: &Gate) {
         if !self.children.is_empty() && self.trimmed.elapsed() >= Duration::from_secs(30) {
@@ -407,7 +499,9 @@ impl Runtime {
                     failed = true;
                     if receiver {
                         *pid = 0;
-                        gate.active.store(false, Ordering::Release);
+                        if !gate.holds_youtube() {
+                            gate.active.store(false, Ordering::Release);
+                        }
                     }
                 }
             }
@@ -437,7 +531,7 @@ impl Runtime {
         status.airplay_available = self.available;
         status.airplay_enabled = self.enabled;
         status.airplay_running = self.running();
-        status.airplay_active = gate.active.load(Ordering::Acquire);
+        status.airplay_active = gate.active.load(Ordering::Acquire) && !gate.holds_youtube();
         status.airplay_error.clone_from(&self.error);
     }
 }
@@ -519,6 +613,41 @@ mod tests {
         gate.reclaim().unwrap();
         assert!(!gate.active.load(Ordering::Acquire));
         assert!(!child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn youtube_can_release_its_gate_while_spotify_waits() {
+        let dir = std::env::temp_dir().join(format!("youtube-gate-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("control");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let gate = std::sync::Arc::new(Gate::new());
+        gate.hold_youtube(path);
+        let peer_gate = gate.clone();
+        let peer = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut std::io::BufReader::new(socket), &mut line).unwrap();
+            assert_eq!(line.trim(), "STOP");
+            peer_gate.release_youtube();
+        });
+        let result = gate.reclaim();
+        peer.join().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert!(!gate.active.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn stopping_idle_airplay_keeps_youtube_ownership() {
+        let dir = std::env::temp_dir().join(format!("airplay-idle-{}", uuid::Uuid::new_v4()));
+        let profile = crate::profiles::load(Some("generic"), &dir).unwrap();
+        let mut runtime = Runtime::new(&dir, &dir, "Test", &profile.profile.audio);
+        let gate = Gate::new();
+        gate.hold_youtube(dir.join("youtube.control"));
+        runtime.stop(&gate).await;
+        assert!(gate.active.load(Ordering::Acquire));
+        assert!(gate.holds_youtube());
     }
 
     #[tokio::test]

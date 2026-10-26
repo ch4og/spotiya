@@ -15,6 +15,7 @@ pub const WARN: Rgb = Rgb(236, 196, 72);
 pub const ERROR: Rgb = Rgb(240, 92, 84);
 pub const INFO: Rgb = Rgb(96, 176, 240);
 pub const AIRPLAY: Rgb = Rgb(186, 132, 246);
+pub const YOUTUBE: Rgb = Rgb(255, 72, 112);
 /// Low to high, as btop colours its meters.
 pub const HEAT: [Rgb; 3] = [Rgb(30, 215, 96), Rgb(236, 204, 64), Rgb(240, 84, 72)];
 

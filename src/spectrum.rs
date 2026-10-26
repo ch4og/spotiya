@@ -44,7 +44,7 @@ impl Spectrum {
         }
         self.updated.store(0, Ordering::Release);
     }
-    fn publish(&self, levels: [u8; BANDS]) {
+    pub(crate) fn publish(&self, levels: [u8; BANDS]) {
         for (slot, level) in self.levels.iter().zip(levels) {
             slot.store(level, Ordering::Relaxed);
         }

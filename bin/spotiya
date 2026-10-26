@@ -44,7 +44,7 @@ def main():
     parser = argparse.ArgumentParser(description="spotiya: terminal controls over ADB")
     parser.add_argument("--device", default=configured_device(), help="ADB serial/IP; otherwise configured or only connected device")
     parser.add_argument("command", nargs="?", default="tui", choices=(
-        "tui", "addons", "addon", "airplay", "login", "status", "play", "pause", "resume", "toggle", "next",
+        "tui", "addons", "addon", "airplay", "youtube", "login", "status", "play", "pause", "resume", "toggle", "next",
         "previous", "volume", "voice", "spectrum", "retry", "release", "start", "stop", "restart", "version", "profile", "profiles", "doctor", "update"))
     parser.add_argument("value", nargs="*")
     args = parser.parse_args()
@@ -52,7 +52,7 @@ def main():
         if not args.value:
             parser.error("play needs a song or artist")
         value = [" ".join(args.value)]
-    elif args.command in ("volume", "voice", "spectrum", "airplay"):
+    elif args.command in ("volume", "voice", "spectrum", "airplay", "youtube"):
         if len(args.value) != 1:
             parser.error(args.command + " needs one value")
         value = args.value
@@ -109,6 +109,9 @@ def main():
         remote_command = "update-file" if len(value) == 2 else ("update-tag" if value else ("update-check" if args.value else "update"))
     elif args.command == "addon":
         remote_command = "addon-install-file" if len(value) == 3 else "addon-" + args.value[0]
+    elif args.command == "youtube" and value[0] not in ("on", "off"):
+        # Anything but on/off is a link to play.
+        remote_command = "youtube-url"
     remote = shlex.join([BASE + "/spotiya", "--" + remote_command] + value)
     if interactive:
         columns, rows = shutil.get_terminal_size(fallback=(80, 24))

@@ -55,6 +55,7 @@ mod tui;
 mod update;
 mod voice;
 mod volume_guard;
+mod youtube;
 
 struct Command {
     action: i32,
@@ -381,8 +382,20 @@ fn options() -> Result<Option<Options>, String> {
                 }
                 return Err("Pairing connection closed before login completed".into());
             }
+            "--youtube-url" => {
+                let url = args.next().ok_or("missing YouTube link")?;
+                if youtube::video_id(&url).is_none() {
+                    return Err("Not a YouTube link".into());
+                }
+                print!(
+                    "{}",
+                    control::request(&format!("YOUTUBE URL {url}")).map_err(|e| e.to_string())?
+                );
+                return Ok(None);
+            }
             "--play" | "--resume" | "--pause" | "--next" | "--previous" | "--toggle"
-            | "--volume" | "--voice" | "--spectrum" | "--airplay" | "--release" | "--retry" => {
+            | "--volume" | "--voice" | "--spectrum" | "--airplay" | "--youtube" | "--release"
+            | "--retry" => {
                 let command = match arg.as_str() {
                     "--play" => format!("PLAY {}", args.next().ok_or("missing music query")?),
                     "--resume" => "RESUME".to_owned(),
@@ -418,7 +431,7 @@ fn options() -> Result<Option<Options>, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "spotiya [--state-dir PATH] [--name NAME] [--profile auto|mini1|mini2|generic|FILE] [--no-buttons] [--no-voice]\nspotiya --profiles | --profile-info | --profile-select ID_OR_JSON\nspotiya --tui | --addons | --login | --status | --version\nspotiya --doctor | --doctor-report PATH\nspotiya --update | --update-check | --update-tag VERSION\nspotiya --update-file ARCHIVE SHA256SUMS\nspotiya --addon-install ID | --addon-install-file ID ARCHIVE SHA256SUMS | --addon-remove ID\nspotiya --play QUERY | --resume | --pause | --toggle | --next | --previous\nspotiya --volume 0..100 | --voice on/off | --spectrum on/off | --airplay on/off | --release | --retry"
+                    "spotiya [--state-dir PATH] [--name NAME] [--profile auto|mini1|mini2|generic|FILE] [--no-buttons] [--no-voice]\nspotiya --profiles | --profile-info | --profile-select ID_OR_JSON\nspotiya --tui | --addons | --login | --status | --version\nspotiya --doctor | --doctor-report PATH\nspotiya --update | --update-check | --update-tag VERSION\nspotiya --update-file ARCHIVE SHA256SUMS\nspotiya --addon-install ID | --addon-install-file ID ARCHIVE SHA256SUMS | --addon-remove ID\nspotiya --play QUERY | --resume | --pause | --toggle | --next | --previous\nspotiya --volume 0..100 | --voice on/off | --spectrum on/off | --airplay on/off | --youtube on/off | --release | --retry\nspotiya --youtube-url LINK"
                 );
                 return Ok(None);
             }
@@ -595,11 +608,20 @@ fn publish_status(
     text: &mut Vec<u8>,
 ) {
     let external = s.airplay.active.load(Ordering::Acquire);
-    s.paused
-        .store(!external && playback.paused(), Ordering::Relaxed);
+    // AirPlay and YouTube share the external-output gate; only YouTube reports pauses.
+    let youtube = external && s.airplay.holds_youtube();
+    s.paused.store(
+        if external {
+            s.airplay.youtube_paused()
+        } else {
+            playback.paused()
+        },
+        Ordering::Relaxed,
+    );
     s.active
         .store(external || playback.active(), Ordering::Release);
-    info.airplay_active = external;
+    info.airplay_active = external && !youtube;
+    info.youtube_active = youtube;
     info.loading = !external && playback.loading();
     info.retry_required = failures.blocked();
     info.retry_after_secs = failures.retry_after();
@@ -615,7 +637,12 @@ fn publish_status(
     } else {
         playback.error().to_owned()
     };
-    info.position_ms = if external {
+    info.position_ms = if youtube {
+        // The add-on reports where its track is; the gate counts on between reports.
+        let (position, duration) = s.airplay.youtube_position().unwrap_or((0, 0));
+        info.duration_ms = duration;
+        position
+    } else if external {
         0
     } else {
         playback.position_ms().min(info.duration_ms)
@@ -816,6 +843,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     let (login_tx, mut login_rx) = mpsc::channel::<auth::Login>(1);
     let control_config = config.clone();
     let (airplay_tx, mut airplay_rx) = mpsc::channel::<airplay::Request>(8);
+    let (youtube_tx, mut youtube_rx) = mpsc::channel::<youtube::Request>(8);
     let control_spectrum = shared.spectrum.clone();
     let voice_control = tokio::spawn(async move {
         if control::serve(
@@ -824,6 +852,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             control_config,
             caps,
             airplay_tx,
+            youtube_tx,
             control_spectrum,
         )
         .await
@@ -916,6 +945,13 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         airplay::Runtime::new(&base, &options.state_dir, &options.name, &profile.audio);
     airplay.poll(&shared.airplay).await;
     airplay.status(&mut info, &shared.airplay);
+    if let Err(e) = youtube::receive_levels(shared.airplay.clone(), shared.spectrum.clone()) {
+        eprintln!("youtube: spectrum levels unavailable: {e}");
+    }
+    let mut youtube =
+        youtube::Runtime::new(&base, &options.state_dir, &options.name, &profile.audio);
+    youtube.poll(&shared.airplay).await;
+    youtube.status(&mut info, &shared.airplay);
     let mut playback = playback::Playback::default();
     let mut failures = recovery::Failures::default();
     let mut retry_track = None::<String>;
@@ -1036,6 +1072,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 let accepted = if request.reply.is_closed() || !airplay.valid(&request.token) { false } else {
                     match request.action {
                         airplay::Action::Begin => {
+                            if shared.airplay.holds_youtube(){youtube.stop(&shared.airplay).await;}
                             shared.airplay.active.store(true,Ordering::Release);
                             if let Some(handle)=spirc.as_ref(){let _=handle.disconnect(true);}
                             player.stop();playback.reset();
@@ -1056,10 +1093,76 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                 };
                 let _=request.reply.send(accepted);
             },
+            Some(request)=youtube_rx.recv()=>{
+                let accepted = if request.reply.is_closed() { false } else {
+                    match request.action {
+                        // The add-on took the speaker for a track (token-authenticated).
+                        youtube::Action::Begin => {
+                            if !youtube.valid(&request.token) { false } else {
+                                if shared.airplay.active.load(Ordering::Acquire) && !shared.airplay.holds_youtube() {
+                                    airplay.stop(&shared.airplay).await;
+                                }
+                                shared.airplay.hold_youtube(youtube.control_path());
+                                if let Some(handle)=spirc.as_ref(){let _=handle.disconnect(true);}
+                                player.stop();playback.reset();
+                                let released=shared.airplay.spotify_released(Instant::now()+Duration::from_millis(1500)).await;
+                                let accepted=shared.airplay.holds_youtube() && released;
+                                if accepted {
+                                    if let Some(address)=native {tokio::spawn(voice::pause_native(address));}
+                                    info.title.clear();info.artist.clear();info.album.clear();info.duration_ms=0;
+                                } else {shared.airplay.release_youtube();}
+                                accepted
+                            }
+                        },
+                        youtube::Action::End=>{
+                            if youtube.valid(&request.token) && shared.airplay.holds_youtube(){
+                                shared.airplay.release_youtube();
+                                info.title.clear();info.artist.clear();info.album.clear();info.duration_ms=0;
+                            }
+                            true
+                        },
+                        youtube::Action::Volume(value)=>{
+                            if youtube.valid(&request.token) && shared.airplay.holds_youtube(){mixer.set_master_volume(from_percent(value));}
+                            true
+                        },
+                        youtube::Action::Title(title)=>{
+                            if youtube.valid(&request.token) && shared.airplay.holds_youtube(){
+                                info.title=title;info.artist.clear();info.album.clear();info.duration_ms=0;
+                            }
+                            true
+                        },
+                        youtube::Action::Paused(paused)=>{
+                            if youtube.valid(&request.token){shared.airplay.set_youtube_paused(paused);}
+                            true
+                        },
+                        youtube::Action::Position(position,duration)=>{
+                            if youtube.valid(&request.token) && shared.airplay.holds_youtube(){shared.airplay.set_youtube_progress(position,duration);}
+                            true
+                        },
+                        // A pasted link or a transport command (trusted local socket, no token).
+                        youtube::Action::Play(id)=>{
+                            match youtube.send(&format!("PLAY {id}")){Ok(())=>true,Err(e)=>{eprintln!("youtube: {e}");false}}
+                        },
+                        youtube::Action::Control(command)=>youtube.send(command).is_ok(),
+                    }
+                };
+                let _=request.reply.send(accepted);
+            },
             Some(command)=command_rx.recv()=>{
                 if std::time::Instant::now()>=command.deadline {continue;}
                 let ok=if shared.airplay.active.load(Ordering::Acquire) {
-                    if command.action==0 {airplay.stop(&shared.airplay).await;true}
+                    // YouTube takes transport commands; AirPlay can only be stopped.
+                    // Volume keys drive the shared mixer for both.
+                    if shared.airplay.holds_youtube() && matches!(command.action,0..=2) {
+                        // The add-on toggles by its own state, which is never stale.
+                        let verb=match command.action {
+                            0=>"TOGGLE",
+                            1=>"NEXT",
+                            _=>"PREVIOUS",
+                        };
+                        youtube.send(verb).is_ok()
+                    }
+                    else if command.action==0 {airplay.stop(&shared.airplay).await;true}
                     else if matches!(command.action,3|4){
                         let target=(percent(mixer.volume()) as i32+if command.action==3{5}else{-5}).clamp(0,100) as u16;
                         mixer.set_master_volume(from_percent(target));true
@@ -1088,6 +1191,13 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                         if let Err(e)=airplay.set_enabled(enabled){eprintln!("airplay: {e}");}
                         airplay.poll(&shared.airplay).await;
                         airplay.status(&mut info,&shared.airplay);
+                        publish_status(&shared,&playback,&failures,rejected,&mut info,&mut last_status,&mut status_buffer);
+                        continue;
+                    },
+                    voice::Intent::Youtube(enabled)=>{
+                        if let Err(e)=youtube.set_enabled(enabled){eprintln!("youtube: {e}");}
+                        youtube.poll(&shared.airplay).await;
+                        youtube.status(&mut info,&shared.airplay);
                         publish_status(&shared,&playback,&failures,rejected,&mut info,&mut last_status,&mut status_buffer);
                         continue;
                     },
@@ -1121,17 +1231,37 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     },
                     voice::Intent::Release=>{
-                        if shared.airplay.active.load(Ordering::Acquire) {airplay.stop(&shared.airplay).await;}
+                        if shared.airplay.holds_youtube() {let _=youtube.send("STOP");}
+                        else if shared.airplay.active.load(Ordering::Acquire) {airplay.stop(&shared.airplay).await;}
                         if let Some(handle)=spirc.as_ref(){let _=handle.disconnect(true);}
                         voice_epoch+=1;
                         playback.reset();shared.paused.store(false,Ordering::Relaxed);
                         shared.active.store(false,Ordering::Release);audio_guard.set_playing(false);
                         continue;
                     },
+                    // YouTube toggles by its own state (below); others by ours.
+                    voice::Intent::Toggle if shared.airplay.holds_youtube()=>voice::Intent::Toggle,
                     voice::Intent::Toggle=>if shared.active.load(Ordering::Acquire)&&!shared.paused.load(Ordering::Relaxed){voice::Intent::Pause}else{voice::Intent::Resume},
                     intent=>intent,
                 };
-                if shared.airplay.active.load(Ordering::Acquire) {
+                if shared.airplay.holds_youtube() {
+                    let verb=match intent {
+                        voice::Intent::Toggle=>Some("TOGGLE"),
+                        voice::Intent::Pause=>Some("PAUSE"),
+                        voice::Intent::Resume=>Some("RESUME"),
+                        voice::Intent::Next=>Some("NEXT"),
+                        voice::Intent::Previous=>Some("PREVIOUS"),
+                        _=>None,
+                    };
+                    if let Some(verb)=verb {let _=youtube.send(verb);continue;}
+                    // A Spotify search takes the speaker; YouTube stops and drains first.
+                    // Without a Spotify connection the search cannot play, so keep YouTube.
+                    if matches!(intent,voice::Intent::Play(_)) && spirc.is_some() {let _=youtube.send("STOP");}
+                    else {
+                        if spirc.is_none() {eprintln!("voice: Spotify is not connected yet");}
+                        continue;
+                    }
+                } else if shared.airplay.active.load(Ordering::Acquire) {
                     if matches!(intent,voice::Intent::Pause|voice::Intent::Toggle) {
                         airplay.stop(&shared.airplay).await;
                         continue;
@@ -1184,6 +1314,8 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             _=tick.tick()=>{
                 airplay.poll(&shared.airplay).await;
                 airplay.status(&mut info,&shared.airplay);
+                youtube.poll(&shared.airplay).await;
+                youtube.status(&mut info,&shared.airplay);
                 if !playback.playing() && Instant::now() >= reclaim_at {
                     unsafe { libc::malloc_trim(0); }
                     reclaim_at=Instant::now()+Duration::from_secs(30);
@@ -1224,6 +1356,7 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     airplay.stop(&shared.airplay).await;
+    youtube.stop(&shared.airplay).await;
     shared.active.store(false, Ordering::Release);
     shared.running.store(false, Ordering::Release);
     if let Some(worker) = voice_watch {
@@ -1279,6 +1412,52 @@ mod tests {
             ))
             .is_none()
         );
+    }
+    #[test]
+    fn youtube_on_the_external_gate_is_not_reported_as_airplay() {
+        let (commands, _receiver) = mpsc::unbounded_channel();
+        let shared = Shared {
+            running: AtomicBool::new(true),
+            active: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
+            volume: AtomicU16::new(0),
+            commands,
+            spectrum: Arc::new(spectrum::Spectrum::new(false)),
+            airplay: Arc::new(airplay::Gate::new()),
+            ducking: Arc::new(ducking::Ducking::new()),
+        };
+        let (playback, failures) = (playback::Playback::default(), recovery::Failures::default());
+        let mut info = control::Status::default();
+        let publish = |info: &mut control::Status| {
+            publish_status(
+                &shared,
+                &playback,
+                &failures,
+                None,
+                info,
+                &mut vec![],
+                &mut vec![],
+            )
+        };
+        shared
+            .airplay
+            .hold_youtube("/nonexistent/youtube.control".into());
+        publish(&mut info);
+        assert!(info.youtube_active && !info.airplay_active && info.active && !info.paused);
+        shared.airplay.set_youtube_progress(60_000, 195_000);
+        publish(&mut info);
+        assert_eq!(info.duration_ms, 195_000);
+        assert!((60_000..61_000).contains(&info.position_ms));
+        shared.airplay.set_youtube_paused(true);
+        let frozen = shared.airplay.youtube_position().unwrap().0;
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        publish(&mut info);
+        assert!(info.youtube_active && info.paused);
+        assert_eq!(info.position_ms, frozen, "a paused bar stands still");
+        shared.airplay.release_youtube();
+        shared.airplay.active.store(true, Ordering::Release);
+        publish(&mut info);
+        assert!(info.airplay_active && !info.youtube_active && !info.paused);
     }
     #[test]
     fn all_volume_percentages_round_trip_through_master() {

@@ -1,0 +1,44 @@
+# Standalone add-on binary: its own workspace so it never pulls in or is pulled
+# into the main receiver's build. Shipped as an optional package like AirPlay.
+[workspace]
+
+[package]
+name = "spotiya-youtube"
+version = "0.9.4"
+edition = "2021"
+license = "MIT"
+description = "YouTube and YouTube Music cast receiver add-on for Spotiya"
+repository = "https://github.com/klockky/spotiya"
+publish = false
+
+[[bin]]
+name = "spotiya-youtube"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros", "signal", "sync"] }
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json", "stream"] }
+rquickjs = { version = "0.14", default-features = false, features = ["std"] }
+opus = "0.3"
+alsa = "0.10"
+bytes = "1"
+libc = { version = "0.2", default-features = false }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_urlencoded = "0.7"
+socket2 = { version = "0.5", features = ["all"] }
+uuid = { version = "1", features = ["v4"] }
+rand = "0.8"
+httpdate = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = 0

@@ -130,6 +130,10 @@ fn safe(text: &str) -> String {
 fn state(status: &Status) -> (&'static str, Rgb) {
     if status.airplay_active {
         ("AIRPLAY 2", screen::AIRPLAY)
+    } else if status.youtube_active && status.paused {
+        ("YOUTUBE PAUSED", screen::WARN)
+    } else if status.youtube_active {
+        ("YOUTUBE", screen::YOUTUBE)
     } else if status.retry_required {
         ("RETRY REQUIRED", screen::ERROR)
     } else if status.login_refused == "premium" {
@@ -266,7 +270,7 @@ fn feature(c: &mut Canvas, area: Area, row: usize, name: &str, value: &str, colo
 fn dashboard(
     status: &Status,
     notice: &str,
-    prompt: Option<&[u8]>,
+    prompt: Option<(&str, &[u8])>,
     history: &History,
     clock: &str,
     width: usize,
@@ -298,6 +302,7 @@ fn dashboard(
     let global: &[(&str, &str)] = &[
         // Most needed first: a narrow edge keeps as many as fit, in this order.
         ("/", "search"),
+        ("y", "youtube"),
         ("q", "quit"),
         ("l", "login"),
         ("d", "profile"),
@@ -346,6 +351,8 @@ fn dashboard(
     }
     let output = if status.airplay_active {
         "AirPlay priority"
+    } else if status.youtube_active {
+        "YouTube priority"
     } else if status.native_guard {
         "Spotify priority"
     } else {
@@ -356,9 +363,9 @@ fn dashboard(
     }
     // Messages under the track: search prompt, errors, then notices.
     let mut messages: Vec<(String, Style)> = vec![];
-    if let Some(input) = prompt {
+    if let Some((label, input)) = prompt {
         messages.push((
-            format!("search › {}▏", String::from_utf8_lossy(input)),
+            format!("{label} › {}▏", String::from_utf8_lossy(input)),
             Style::bold(screen::ACCENT),
         ));
     }
@@ -387,6 +394,8 @@ fn dashboard(
     // Long names and messages wrap; a pairing URL and code must stay readable in full.
     let title = if status.airplay_active {
         "AirPlay audio"
+    } else if status.youtube_active && status.title.is_empty() {
+        "YouTube audio"
     } else if status.title.is_empty() {
         "No track selected"
     } else {
@@ -441,7 +450,8 @@ fn dashboard(
         &[("␣", toggle), ("n", "next"), ("p", "prev"), ("+-", "vol")],
     );
     let inner = left.inner();
-    let title_style = if status.title.is_empty() && !status.airplay_active {
+    let title_style = if status.title.is_empty() && !status.airplay_active && !status.youtube_active
+    {
         Style::new(screen::DIM)
     } else {
         Style::bold(screen::TITLE)
@@ -538,12 +548,32 @@ fn dashboard(
         ("starting", screen::WARN)
     };
     feature(&mut c, inner, 3, "airplay", value, colour);
+    // The YouTube row needs a sixth line; on a short panel it stays in the add-ons menu only.
+    let alice_row = if inner.h >= 6 {
+        let (value, colour) = if !status.youtube_available {
+            ("not installed", screen::DIM)
+        } else if !status.youtube_enabled {
+            ("off", screen::DIM)
+        } else if !status.youtube_error.is_empty() {
+            ("error", screen::ERROR)
+        } else if status.youtube_active {
+            ("playing", screen::ACCENT)
+        } else if status.youtube_running {
+            ("ready", screen::ACCENT)
+        } else {
+            ("starting", screen::WARN)
+        };
+        feature(&mut c, inner, 4, "youtube", value, colour);
+        5
+    } else {
+        4
+    };
     let (value, colour) = if status.ducking {
         ("ducked for Alice", screen::WARN)
     } else {
         ("idle", screen::DIM)
     };
-    feature(&mut c, inner, 4, "alice", value, colour);
+    feature(&mut c, inner, alice_row, "alice", value, colour);
     // Spectrum history fills the rest of the screen.
     let top = right.y + right.h;
     let rest = height.saturating_sub(top);
@@ -920,7 +950,8 @@ fn session(state_dir: &Path, show_addons: bool) -> io::Result<()> {
     let mut status = Status::default();
     // Key hints live in the panel borders, so the message line starts empty.
     let mut notice = String::new();
-    let mut prompt: Option<Vec<u8>> = None;
+    // (is_youtube, typed bytes): a YouTube link prompt vs. a Spotify search prompt.
+    let mut prompt: Option<(bool, Vec<u8>)> = None;
     let mut profiles: Option<ProfileMenu> = None;
     let mut addons = show_addons.then(AddonMenu::default);
     let (addon_messages, addon_rx) = mpsc::channel();
@@ -1009,7 +1040,9 @@ fn session(state_dir: &Path, show_addons: bool) -> io::Result<()> {
                 let canvas = dashboard(
                     &status,
                     &notice,
-                    prompt.as_deref(),
+                    prompt.as_ref().map(|(yt, text)| {
+                        (if *yt { "youtube" } else { "search" }, text.as_slice())
+                    }),
                     &history,
                     &local_clock(offset),
                     width,
@@ -1130,7 +1163,7 @@ fn session(state_dir: &Path, show_addons: bool) -> io::Result<()> {
                 last_draw = Instant::now() - Duration::from_secs(1);
                 continue;
             }
-            if let Some(text) = prompt.as_mut() {
+            if let Some((youtube, text)) = prompt.as_mut() {
                 match key {
                     27 => prompt = None,
                     127 | 8 => {
@@ -1141,12 +1174,21 @@ fn session(state_dir: &Path, show_addons: bool) -> io::Result<()> {
                         }
                     }
                     b'\r' | b'\n' => {
+                        let youtube = *youtube;
                         let query = String::from_utf8_lossy(text).into_owned();
                         prompt = None;
                         notice = if query.trim().is_empty() {
-                            "Search cancelled".into()
+                            "Cancelled".into()
+                        } else if youtube {
+                            match control::request(&format!("YOUTUBE URL {}", query.trim())) {
+                                Ok(_) => "Playing on YouTube".into(),
+                                Err(e) => e.to_string(),
+                            }
                         } else {
+                            // The receiver plays YouTube links itself; say which one happens.
+                            let link = crate::youtube::link(query.trim()).is_some();
                             match control::request(&format!("PLAY {}", query.trim())) {
+                                Ok(_) if link => "Playing on YouTube".into(),
                                 Ok(_) => "Spotify search queued".into(),
                                 Err(e) => e.to_string(),
                             }
@@ -1211,7 +1253,11 @@ fn session(state_dir: &Path, show_addons: bool) -> io::Result<()> {
                     None
                 }
                 b'/' => {
-                    prompt = Some(Vec::new());
+                    prompt = Some((false, Vec::new()));
+                    None
+                }
+                b'y' => {
+                    prompt = Some((true, Vec::new()));
                     None
                 }
                 b'l' => {
@@ -1384,6 +1430,52 @@ mod tests {
     }
     fn has(rows: &[String], text: &str) -> bool {
         rows.iter().any(|row| row.contains(text))
+    }
+    #[test]
+    fn youtube_playback_is_labelled_youtube_with_its_title() {
+        let mut status = Status {
+            connected: true,
+            active: true,
+            youtube_active: true,
+            title: "linkin kla$ - given up".into(),
+            ..Default::default()
+        };
+        let frame = rows(&status, "", 100, 30);
+        assert!(has(&frame, "YOUTUBE"));
+        assert!(has(&frame, "linkin kla$ - given up"));
+        assert!(has(&frame, "YouTube priority"));
+        assert!(!has(&frame, "AIRPLAY") && !has(&frame, "AirPlay"));
+        status.paused = true;
+        assert!(has(&rows(&status, "", 100, 30), "YOUTUBE PAUSED"));
+        status.title.clear();
+        assert!(has(&rows(&status, "", 100, 30), "YouTube audio"));
+    }
+    #[test]
+    fn youtube_link_prompt_and_status_row_are_shown() {
+        let status = Status {
+            connected: true,
+            youtube_available: true,
+            youtube_enabled: true,
+            youtube_running: true,
+            youtube_active: true,
+            ..Default::default()
+        };
+        let canvas = dashboard(
+            &status,
+            "",
+            Some(("youtube", b"https://youtu.be/O5sjrLI5mSs")),
+            &History::default(),
+            "12:00",
+            100,
+            40,
+        );
+        let frame: Vec<String> = (0..40).map(|y| canvas.row(y)).collect();
+        assert!(has(&frame, "youtube › https://youtu.be/O5sjrLI5mSs"));
+        assert!(
+            frame
+                .iter()
+                .any(|r| r.contains("youtube") && r.contains("playing"))
+        );
     }
     #[test]
     fn loading_and_failed_tracks_are_not_shown_as_playing() {

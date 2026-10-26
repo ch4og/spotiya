@@ -46,6 +46,14 @@ case "${1:-tui}" in
             set -- --profile-info
         fi
         ;;
+    youtube)
+        shift
+        case "${1:-}" in
+            on|off) set -- --youtube "$1" ;;
+            '') echo 'Usage: spotiya youtube on|off|LINK' >&2; exit 1 ;;
+            *) set -- --youtube-url "$1" ;;
+        esac
+        ;;
     tui|addons|login|status|pause|resume|toggle|next|previous|volume|voice|spectrum|airplay|retry|release|version|help|profiles)
         SPOTIYA_COMMAND=${1:-tui}
         [ "$#" -eq 0 ] || shift
@@ -53,7 +61,7 @@ case "${1:-tui}" in
         ;;
 esac
 case "${1:-}" in
-    --tui|--addons|--login|--play|--pause|--resume|--toggle|--next|--previous|--volume|--voice|--spectrum|--airplay|--retry|--release)
+    --tui|--addons|--login|--play|--pause|--resume|--toggle|--next|--previous|--volume|--voice|--spectrum|--airplay|--youtube|--youtube-url|--retry|--release)
         "$SPOTIYA_BASE/start.sh" >/dev/null
         ;;
 esac

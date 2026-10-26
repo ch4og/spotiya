@@ -1,4 +1,5 @@
 /target/
+/youtube/target/
 /dist/
 /.cache/
 __pycache__/

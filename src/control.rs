@@ -28,6 +28,11 @@ pub struct Status {
     pub airplay_running: bool,
     pub airplay_active: bool,
     pub airplay_error: String,
+    pub youtube_available: bool,
+    pub youtube_enabled: bool,
+    pub youtube_running: bool,
+    pub youtube_active: bool,
+    pub youtube_error: String,
     pub paused: bool,
     pub loading: bool,
     pub error: String,
@@ -67,6 +72,8 @@ pub fn parse(line: &str) -> Option<Intent> {
         "SPECTRUM OFF" => Some(Intent::Spectrum(false)),
         "AIRPLAY ON" => Some(Intent::Airplay(true)),
         "AIRPLAY OFF" => Some(Intent::Airplay(false)),
+        "YOUTUBE ON" => Some(Intent::Youtube(true)),
+        "YOUTUBE OFF" => Some(Intent::Youtube(false)),
         "RETRY" => Some(Intent::Retry),
         "RELEASE" => Some(Intent::Release),
         s => {
@@ -90,6 +97,7 @@ pub async fn serve(
     config: SessionConfig,
     capabilities: crate::profiles::Capabilities,
     airplay: mpsc::Sender<crate::airplay::Request>,
+    youtube: mpsc::Sender<crate::youtube::Request>,
     spectrum: Arc<crate::spectrum::Spectrum>,
 ) -> io::Result<()> {
     let _ = fs::remove_file(voice::CONTROL);
@@ -117,6 +125,7 @@ pub async fn serve(
         let logins = logins.clone();
         let config = config.clone();
         let airplay = airplay.clone();
+        let youtube = youtube.clone();
         let login_lock = login_lock.clone();
         let spectrum = spectrum.clone();
         tokio::spawn(async move {
@@ -154,6 +163,27 @@ pub async fn serve(
                 } else {
                     "ERROR AirPlay handover failed\n".into()
                 }
+            } else if let Some((action, token)) = crate::youtube::parse(&line) {
+                youtube_request(&youtube, action, token).await
+            } else if let Some(rest) = line.trim().strip_prefix("YOUTUBE URL ") {
+                match crate::youtube::video_id(rest) {
+                    Some(id) => youtube_play(&youtube, id).await,
+                    None => "ERROR Not a YouTube link\n".into(),
+                }
+            } else if let Some(id) = line
+                .trim()
+                .strip_prefix("PLAY ")
+                .and_then(crate::youtube::link)
+            {
+                // A YouTube link typed into the search goes to YouTube, not Spotify search.
+                youtube_play(&youtube, id).await
+            } else if line.trim() == "YOUTUBE STOP" {
+                youtube_request(
+                    &youtube,
+                    crate::youtube::Action::Control("STOP"),
+                    String::new(),
+                )
+                .await
             } else if line.trim() == "LEVELS" {
                 levels(spectrum.frame())
             } else if line.trim() == "STATUS" {
@@ -170,6 +200,13 @@ pub async fn serve(
                     ))
                 {
                     "ERROR Install the optional AirPlay 2 package first\n".into()
+                } else if matches!(intent, Intent::Youtube(true))
+                    && !status.youtube_available
+                    && !crate::addons::youtube_available(std::path::Path::new(
+                        crate::installation::BASE,
+                    ))
+                {
+                    "ERROR Install the optional YouTube package first\n".into()
                 } else if matches!(intent, Intent::Retry)
                     && (!status.retry_required || status.retry_after_secs > 0)
                 {
@@ -209,6 +246,45 @@ pub async fn serve(
             };
             let _ = socket.write_all(reply.as_bytes()).await;
         });
+    }
+}
+/// Plays a video, or explains why it cannot when the add-on is not running.
+async fn youtube_play(youtube: &mpsc::Sender<crate::youtube::Request>, id: String) -> String {
+    let status = fs::read_to_string(STATUS)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Status>(&s).ok())
+        .unwrap_or_default();
+    if !status.youtube_available {
+        return "ERROR Install the optional YouTube package to play YouTube links\n".into();
+    }
+    if !status.youtube_enabled {
+        return "ERROR Turn on the YouTube add-on to play YouTube links\n".into();
+    }
+    youtube_request(youtube, crate::youtube::Action::Play(id), String::new()).await
+}
+/// Sends a YouTube handover or playback request to the receiver loop and waits
+/// for its verdict. Returns the control-socket reply line.
+async fn youtube_request(
+    youtube: &mpsc::Sender<crate::youtube::Request>,
+    action: crate::youtube::Action,
+    token: String,
+) -> String {
+    let (reply, result) = tokio::sync::oneshot::channel();
+    if youtube
+        .try_send(crate::youtube::Request {
+            action,
+            token,
+            reply,
+        })
+        .is_ok()
+        && matches!(
+            tokio::time::timeout(Duration::from_secs(5), result).await,
+            Ok(Ok(true))
+        )
+    {
+        "OK\n".into()
+    } else {
+        "ERROR YouTube command failed\n".into()
     }
 }
 /// The live spectrum for the TUI graph; `-` while it is off or no audio is playing.

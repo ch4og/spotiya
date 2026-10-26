@@ -95,6 +95,25 @@ pub static CATALOG: &[Addon] = &[
             error: "",
         },
     },
+    Addon {
+        id: "youtube",
+        name: "YouTube",
+        description: "Cast from the YouTube and YouTube Music apps, or paste a link. Disabled when off.",
+        asset: "spotiya-youtube-armv7.tar.gz",
+        sums: "YOUTUBE_SHA256SUMS",
+        root: "spotiya-youtube",
+        directory: "youtube",
+        bins: &["spotiya-youtube"],
+        setting: Some("youtube-enabled"),
+        legacy: None,
+        command: Some("YOUTUBE"),
+        state: |s| State {
+            installed: s.youtube_available,
+            enabled: s.youtube_enabled,
+            running: s.youtube_running,
+            error: &s.youtube_error,
+        },
+    },
 ];
 pub fn find(id: &str) -> io::Result<&'static Addon> {
     CATALOG
@@ -107,6 +126,9 @@ pub fn airplay_available(base: &Path) -> bool {
         fs::metadata(base.join("airplay/bin").join(name))
             .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
     })
+}
+pub fn youtube_available(base: &Path) -> bool {
+    crate::youtube::available(base)
 }
 
 #[derive(Deserialize)]

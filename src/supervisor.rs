@@ -61,6 +61,8 @@ fn offline_status(config: &Config, message: &str) {
     status.active = false;
     status.airplay_active = false;
     status.airplay_running = false;
+    status.youtube_active = false;
+    status.youtube_running = false;
     status.paused = false;
     status.loading = false;
     status.connected = false;
