@@ -31,15 +31,23 @@ pub struct Event {
     pub from_voice: bool,
 }
 
+fn without_activation(text: &str) -> &str {
+    text.strip_prefix("алиса,")
+        .or_else(|| text.strip_prefix("алиса "))
+        .unwrap_or(text)
+        .trim()
+}
+
 pub fn intent(text: &str) -> Option<Intent> {
     let text = text
         .trim()
         .trim_matches(['.', '!', '?'])
         .to_lowercase()
         .replace('ё', "е");
-    let text = text.strip_prefix("алиса, ").unwrap_or(&text).trim();
+    let text = without_activation(&text);
     match text {
         "стоп"
+        | "хватит"
         | "пауза"
         | "останови музыку"
         | "выключи музыку"
@@ -52,8 +60,12 @@ pub fn intent(text: &str) -> Option<Intent> {
         "назад" | "предыдущий трек" | "предыдущая песня" => {
             return Some(Intent::Previous);
         }
-        "продолжи" | "продолжи музыку" | "продолжай музыку" | "включи музыку" =>
-        {
+        "играй"
+        | "продолжи"
+        | "продолжай"
+        | "продолжи музыку"
+        | "продолжай музыку"
+        | "включи музыку" => {
             return Some(Intent::Resume);
         }
         _ => {}
@@ -118,7 +130,7 @@ pub fn intent(text: &str) -> Option<Intent> {
 
 fn native_volume_request(text: &str) -> bool {
     let normalized = text.trim().to_lowercase().replace('ё', "е");
-    let text = normalized.strip_prefix("алиса, ").unwrap_or(&normalized);
+    let text = without_activation(&normalized);
     let mut words = text.split_whitespace();
     let Some(first) = words.next() else {
         return false;
@@ -258,6 +270,30 @@ fn recognized(data: &[u8]) -> Option<(String, String)> {
     }
     Some((request.to_owned(), text.to_owned()))
 }
+fn quick_command(data: &[u8]) -> Option<&str> {
+    if number(data, 253) != Some(210) {
+        return None;
+    }
+    let remoting = bytes(data, 252)?;
+    if bytes(remoting, 7)? != b"CommandSpotterCapability" {
+        return None;
+    }
+    // SpotterCapabilityListenerMethod: method 2 reports a spotted phrase in field 3.
+    let method = bytes(remoting, 15)?;
+    if number(method, 1) != Some(2) {
+        return None;
+    }
+    let phrase = bytes(method, 3)?;
+    if phrase.len() > 64 {
+        return None;
+    }
+    let phrase = std::str::from_utf8(phrase).ok()?;
+    match phrase {
+        "хватит" | "стоп" | "пауза" | "играй" | "продолжи" | "продолжай" | "дальше" | "назад"
+        | "следующий" | "громче" | "тише" => Some(phrase),
+        _ => None,
+    }
+}
 fn put_var(out: &mut Vec<u8>, mut v: u64) {
     while v >= 128 {
         out.push((v as u8 & 127) | 128);
@@ -347,6 +383,18 @@ async fn read_events(
         socket.read_exact(&mut data).await?;
         if let Some(busy) = alice_busy(&data) {
             ducking.set_busy(busy);
+        }
+        if let Some(phrase) = quick_command(&data) {
+            if native_volume_request(phrase) {
+                // Quasar already changes Master; only preserve it through dialogue ducking.
+                ducking.volume.native_command();
+            } else if let Some(intent) = intent(phrase) {
+                let _ = sender.try_send(Event {
+                    intent,
+                    received: Instant::now(),
+                    from_voice: true,
+                });
+            }
         }
         if let Some((request, text)) = recognized(&data)
             && !seen.contains(&request)
@@ -454,6 +502,8 @@ mod tests {
             "увеличь громкость",
             "выключи звук",
             "Алиса, установи громкость 3",
+            "Алиса громче",
+            "Алиса,тише",
         ] {
             assert!(native_volume_request(text), "{text}");
         }
@@ -477,6 +527,87 @@ mod tests {
         put_bytes(&mut msg, 252, &body);
         put_number(&mut msg, 253, kind);
         msg
+    }
+    fn spotter_message(capability: &str, method: u64, phrase: &[u8]) -> Vec<u8> {
+        let mut event = Vec::new();
+        put_number(&mut event, 1, method);
+        put_bytes(&mut event, 3, phrase);
+        rpc(capability, 15, &event)[4..].to_vec()
+    }
+    #[test]
+    fn quick_commands_require_the_command_spotter_and_a_known_spotted_phrase() {
+        // Captured from Mini 2: Remoting { capability: CommandSpotterCapability,
+        // spotter_listener: { method: 2, phrase: "хватит" } }.
+        let msg = spotter_message("CommandSpotterCapability", 2, "хватит".as_bytes());
+        assert_eq!(quick_command(&msg), Some("хватит"));
+        for n in 0..msg.len() {
+            assert_eq!(quick_command(&msg[..n]), None);
+        }
+        for (capability, method, phrase) in [
+            ("ActivationSpotterCapability", 2, "хватит".as_bytes()),
+            ("CommandSpotterCapability", 1, "хватит".as_bytes()),
+            ("CommandSpotterCapability", 2, b"\xff".as_slice()),
+            ("CommandSpotterCapability", 2, "включи свет".as_bytes()),
+            ("CommandSpotterCapability", 2, "включи Radiohead".as_bytes()),
+        ] {
+            assert_eq!(
+                quick_command(&spotter_message(capability, method, phrase)),
+                None
+            );
+        }
+        assert_eq!(quick_command(&state_message(Some(1), 3)), None);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn quick_phrases_dispatch_transport_and_keep_native_volume_without_duplicate_steps() {
+        let (mut client, mut server) = tokio::io::duplex(2048);
+        let (sender, mut commands) = mpsc::channel(8);
+        let duck = Arc::new(crate::ducking::Ducking::new());
+        let observed = duck.clone();
+        let reader = tokio::spawn(async move {
+            read_events(&mut server, &sender, &observed, &mut VecDeque::new()).await
+        });
+        let cases = [
+            ("хватит", Intent::Pause),
+            ("продолжи", Intent::Resume),
+            ("продолжай", Intent::Resume),
+            ("дальше", Intent::Next),
+            ("назад", Intent::Previous),
+        ];
+        for (phrase, intent) in cases {
+            let msg = spotter_message("CommandSpotterCapability", 2, phrase.as_bytes());
+            client.write_u32_le(msg.len() as u32).await.unwrap();
+            for chunk in msg.chunks(3) {
+                client.write_all(chunk).await.unwrap();
+            }
+            let event = tokio::time::timeout(Duration::from_secs(1), commands.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(event.intent, intent);
+            assert!(event.from_voice);
+        }
+        duck.volume.set_enabled(true);
+        duck.set_busy(true);
+        for phrase in ["громче", "тише"] {
+            let msg = spotter_message("CommandSpotterCapability", 2, phrase.as_bytes());
+            client.write_u32_le(msg.len() as u32).await.unwrap();
+            client.write_all(&msg).await.unwrap();
+        }
+        // A transport event after both volume messages proves the reader processed them.
+        let msg = spotter_message("CommandSpotterCapability", 2, "пауза".as_bytes());
+        client.write_u32_le(msg.len() as u32).await.unwrap();
+        client.write_all(&msg).await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(1), commands.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.intent, Intent::Pause);
+        assert!(commands.try_recv().is_err());
+        duck.set_busy(false);
+        tokio::time::advance(Duration::from_millis(800)).await;
+        assert_eq!(duck.volume.restore_target(20, 80), Some(20));
+        drop(client);
+        assert!(reader.await.unwrap().is_err());
     }
     #[test]
     fn alice_activity_includes_listening_thinking_and_speech_only() {
@@ -532,6 +663,14 @@ mod tests {
             Some(Intent::Play("все идет по плану".into()))
         );
         assert_eq!(intent("Останови музыку"), Some(Intent::Pause));
+        for phrase in ["Хватит!", "Алиса, хватит", "Алиса хватит", "Алиса,хватит"]
+        {
+            assert_eq!(intent(phrase), Some(Intent::Pause), "{phrase}");
+        }
+        for phrase in ["Играй", "Продолжи", "Продолжай", "Алиса, продолжай"]
+        {
+            assert_eq!(intent(phrase), Some(Intent::Resume), "{phrase}");
+        }
         assert_eq!(intent("Включи музыку"), Some(Intent::Resume));
         assert_eq!(intent("Продолжи музыку"), Some(Intent::Resume));
         assert_eq!(intent("следующий трек"), Some(Intent::Next));
@@ -542,6 +681,9 @@ mod tests {
             "включи телевизор",
             "включи блютуз",
             "какая погода",
+            "хватит рассказывать",
+            "продолжай рассказ",
+            "Алиса, хватит говорить",
         ] {
             assert_eq!(intent(s), None, "{s}");
         }
