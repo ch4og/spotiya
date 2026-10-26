@@ -2,6 +2,12 @@
 set -eu
 SPOTIYA_BASE=/data/opt/spotify-connect
 case "${1:-tui}" in
+    uninstall)
+        shift
+        if [ "$#" -eq 0 ] || { [ "$#" -eq 1 ] && [ "$1" = --yes ]; }; then
+            set -- --uninstall "$@"
+        else echo 'Usage: spotiya uninstall [--yes]' >&2; exit 1; fi
+        ;;
     addon)
         shift
         if [ "$#" -eq 2 ] && [ "$1" = install ]; then

@@ -34,7 +34,7 @@ class InstallerTests(unittest.TestCase):
             self.executable(self.commands / name, ("#!/bin/sh\n" + body + "\n").encode())
         self.binary = b'''#!/bin/sh
 printf '%s\\n' "$*" >> "$TEST_LOG"
-case "$1" in --version) echo 'spotiya 0.9.3';; --update) [ "${TEST_UPDATE_FAILURE:-0}" = 0 ] || exit 1;; esac
+case "$1" in --help) [ "${TEST_LEGACY:-0}" = 1 ] || echo '--uninstall [--yes]';; --version) echo 'spotiya 0.9.3';; --update) [ "${TEST_UPDATE_FAILURE:-0}" = 0 ] || exit 1;; esac
 '''
         archive = self.directory / ASSET
         with tarfile.open(archive, "w:gz") as output:
@@ -87,12 +87,13 @@ except Exception:
         section = readme.split("## Быстрая установка и обновление\n", 1)[1]
         command = section.split("```sh\n", 1)[1].split("\n```", 1)[0]
         self.assertEqual(len(command.splitlines()), 1)
+        self.assertLess(len(command.encode()), 1024, "BusyBox terminals truncate longer commands")
         return (command.replace("/data/opt/spotify-connect", str(self.base))
                 .replace("/system/vendor/quasar/maind", str(self.directory / "maind"))
                 .replace("/etc/ssl/certs/ca-certificates.crt", str(self.directory / "ca.crt")))
 
-    def run_fast(self, **environment):
-        return subprocess.run(["sh", "-c", self.fast_command()], env=dict(self.env, **environment), capture_output=True, text=True)
+    def run_fast(self, input_text="1\n", **environment):
+        return subprocess.run(["sh", "-c", self.fast_command()], env=dict(self.env, **environment), input=input_text, capture_output=True, text=True)
 
     @staticmethod
     def executable(path, body):
@@ -105,13 +106,13 @@ except Exception:
         self.thread.join()
         self.temporary.cleanup()
 
-    def run_installer(self, *args, **environment):
-        return subprocess.run(["sh", str(self.script), *args], env=dict(self.env, **environment), capture_output=True, text=True)
+    def run_installer(self, *args, input_text=None, **environment):
+        return subprocess.run(["sh", str(self.script), *args], env=dict(self.env, **environment), input=input_text, capture_output=True, text=True)
 
     def calls(self):
         return self.log.read_text().splitlines() if self.log.exists() else []
 
-    def test_readme_command_installs_then_updates_without_a_second_bootstrap(self):
+    def test_readme_command_opens_menu_then_installs_or_updates(self):
         result = self.run_fast()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.calls(), ["--version", "install"])
@@ -121,7 +122,6 @@ except Exception:
         for path, data in saved.items():
             path.write_bytes(data)
         self.log.unlink()
-        self.script.unlink()
         (self.directory / ASSET).unlink()
         result = self.run_fast()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -134,6 +134,51 @@ except Exception:
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Installer download failed", result.stderr)
         self.assertFalse((self.directory / "unexpected-execution").exists())
+        self.assertFalse(self.base.exists())
+        self.assertEqual(self.calls(), [])
+
+    def test_menu_cancellation_empty_choice_and_eof_do_not_install(self):
+        for choice in ("0\n", "\n", ""):
+            result = self.run_fast(input_text=choice)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Cancelled", result.stdout)
+            self.assertEqual(self.calls(), [])
+            self.assertFalse(self.base.exists())
+
+    def test_menu_retries_invalid_selection_and_supports_check(self):
+        result = self.run_installer(input_text="bad\n2\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Enter 0, 1, 2 or 3", result.stdout)
+        self.assertEqual(self.calls(), ["--version"])
+        self.assertFalse(self.base.exists())
+
+    def test_uninstall_uses_installed_binary_without_downloading_or_updating(self):
+        self.base.mkdir()
+        self.executable(self.base / "spotiya", self.binary)
+        (self.directory / ASSET).unlink()
+        result = self.run_installer(input_text="3\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(), ["--help", "--uninstall"])
+        self.log.unlink()
+        result = self.run_installer("--uninstall", "--yes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(), ["--help", "--uninstall --yes"])
+
+    def test_older_installation_uses_downloaded_uninstaller_without_installing(self):
+        self.base.mkdir()
+        self.executable(self.base / "spotiya", self.binary)
+        result = self.run_installer("--uninstall", "--yes", TEST_LEGACY="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(), ["--help", "--version", "--uninstall --yes"])
+        self.assertNotIn("Spotiya is ready", result.stdout)
+
+    def test_uninstall_missing_installation_and_invalid_yes_do_nothing(self):
+        result = self.run_installer("--uninstall", "--yes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("not installed", result.stdout)
+        result = self.run_installer("--install", "--yes")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--yes requires", result.stderr)
         self.assertFalse(self.base.exists())
         self.assertEqual(self.calls(), [])
 
@@ -165,7 +210,7 @@ except Exception:
         self.assertFalse(self.base.exists())
 
     def test_fresh_install_uses_the_packaged_transactional_installer(self):
-        result = self.run_installer()
+        result = self.run_installer("--install")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.calls(), ["--version", "install"])
         self.assertTrue((self.base / "spotiya").is_file())
@@ -174,30 +219,30 @@ except Exception:
         self.base.mkdir()
         self.executable(self.base / "spotiya", self.binary)
         (self.directory / ASSET).unlink()
-        self.assertEqual(self.run_installer().returncode, 0)
+        self.assertEqual(self.run_installer("--install").returncode, 0)
         self.assertEqual(self.calls(), ["--update"])
 
     def test_corruption_and_incompatible_architecture_cannot_execute_download(self):
         with (self.directory / ASSET).open("ab") as file:
             file.write(b"changed")
-        result = self.run_installer()
+        result = self.run_installer("--install")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("checksum mismatch", result.stderr)
         self.assertEqual(self.calls(), [])
-        result = self.run_installer(TEST_ARCH="x86_64")
+        result = self.run_installer("--install", TEST_ARCH="x86_64")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("ARMv7", result.stderr)
         self.assertEqual(self.calls(), [])
 
     def test_factory_tool_success_exit_after_tls_failure_does_not_install_partial_data(self):
-        result = self.run_installer(TEST_DOWNLOAD_ERROR="1")
+        result = self.run_installer("--install", TEST_DOWNLOAD_ERROR="1")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("HTTPS download did not complete", result.stderr)
         self.assertEqual(self.calls(), [])
         self.assertFalse(self.base.exists())
 
     def test_installer_failure_is_reported_as_failure(self):
-        result = self.run_installer(TEST_INSTALL_FAILURE="1")
+        result = self.run_installer("--install", TEST_INSTALL_FAILURE="1")
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("Spotiya is ready", result.stdout)
         self.assertEqual(self.calls(), ["--version", "install"])
@@ -206,12 +251,12 @@ except Exception:
     def test_duplicate_or_foreign_checksum_entries_are_rejected(self):
         sums = self.directory / "SHA256SUMS"
         sums.write_text(sums.read_text() * 2)
-        result = self.run_installer()
+        result = self.run_installer("--install")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Invalid or duplicate", result.stderr)
         self.assertEqual(self.calls(), [])
         sums.write_text("0" * 64 + "  /etc/passwd\n")
-        result = self.run_installer()
+        result = self.run_installer("--install")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Invalid or duplicate", result.stderr)
         self.assertEqual(self.calls(), [])

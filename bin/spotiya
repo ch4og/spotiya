@@ -43,11 +43,14 @@ def select_device(parser, explicit):
 def main():
     parser = argparse.ArgumentParser(description="spotiya: terminal controls over ADB")
     parser.add_argument("--device", default=configured_device(), help="ADB serial/IP; otherwise configured or only connected device")
+    parser.add_argument("--yes", action="store_true", help="confirm complete removal with uninstall")
     parser.add_argument("command", nargs="?", default="tui", choices=(
         "tui", "addons", "addon", "airplay", "youtube", "login", "status", "play", "pause", "resume", "toggle", "next",
-        "previous", "volume", "voice", "spectrum", "retry", "release", "start", "stop", "restart", "version", "profile", "profiles", "doctor", "update"))
+        "previous", "volume", "voice", "spectrum", "retry", "release", "start", "stop", "restart", "version", "profile", "profiles", "doctor", "update", "uninstall"))
     parser.add_argument("value", nargs="*")
     args = parser.parse_args()
+    if args.yes and args.command != "uninstall":
+        parser.error("--yes requires uninstall")
     if args.command == "play":
         if not args.value:
             parser.error("play needs a song or artist")
@@ -95,10 +98,10 @@ def main():
     adb = ["adb", "-s", select_device(parser, args.device)]
     if args.command in ("start", "stop", "restart"):
         os.execvp("adb", adb + ["shell", shlex.join(["/etc/init.d/S99spotify-connect", args.command])])
-    interactive = args.command in ("tui", "addons")
+    interactive = args.command in ("tui", "addons") or (args.command == "uninstall" and not args.yes)
     if interactive and not sys.stdin.isatty():
         parser.error(args.command + " needs an interactive terminal")
-    if args.command not in ("status", "version", "profile", "profiles", "doctor", "update", "addon"):
+    if args.command not in ("status", "version", "profile", "profiles", "doctor", "update", "addon", "uninstall"):
         start = subprocess.run(adb + ["shell", shlex.join([BASE + "/start.sh"])], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if start.returncode or not any(s in start.stdout for s in ("already running", "Connect started")):
             sys.exit(start.stdout.strip() or "Unable to start receiver")
@@ -113,6 +116,8 @@ def main():
         # Anything but on/off is a link to play.
         remote_command = "youtube-url"
     remote = shlex.join([BASE + "/spotiya", "--" + remote_command] + value)
+    if args.command == "uninstall" and args.yes:
+        remote += " --yes"
     if interactive:
         columns, rows = shutil.get_terminal_size(fallback=(80, 24))
         # adb does not forward the environment; truecolor support decides the TUI palette.

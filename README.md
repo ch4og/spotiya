@@ -18,13 +18,16 @@ Spotify Connect для Яндекс Станций: музыка, голосов
 **вместе со скобками**, и нажмите Enter:
 
 ```sh
-(set -e; p=/data/opt/spotify-connect/spotiya; [ ! -x "$p" ] || exec "$p" --update; d=$(mktemp -d /tmp/spotiya.XXXXXX); trap 'rm -rf "$d"' EXIT; cd "$d"; echo 'Downloading Spotiya...'; get() { LD_LIBRARY_PATH=/system/vendor/quasar/libs /system/vendor/quasar/maind --gst-launch "souphttpsrc location=https://github.com/klockky/spotiya/releases/latest/download/$1 ssl-strict=true ssl-ca-file=/etc/ssl/certs/ca-certificates.crt iradio-mode=false timeout=15 retries=1 ! filesink location=$1" >log 2>&1 && grep -Fq 'EOS: end of stream' log && ! grep -Fq 'ERROR from ' log && [ -s "$1" ]; }; get INSTALL_SHA256SUMS && get install.sh || { echo 'Installer download failed.' >&2; exit 1; }; [ "$(wc -l <INSTALL_SHA256SUMS)" -eq 1 ] && grep -Eqx '[0-9a-f]{64}  install\.sh' INSTALL_SHA256SUMS && sha256sum -c INSTALL_SHA256SUMS || { echo 'Installer checksum mismatch.' >&2; exit 1; }; sh install.sh)
+(set -e; d=$(mktemp -d /tmp/spotiya.XXXXXX); trap 'rm -rf "$d"' EXIT; cd "$d"; echo 'Downloading Spotiya...'; get() { LD_LIBRARY_PATH=/system/vendor/quasar/libs /system/vendor/quasar/maind --gst-launch "souphttpsrc location=https://github.com/klockky/spotiya/releases/latest/download/$1 ssl-strict=true ssl-ca-file=/etc/ssl/certs/ca-certificates.crt iradio-mode=false timeout=15 retries=1 ! filesink location=$1" >log 2>&1 && grep -Fq 'EOS: end of stream' log && ! grep -Fq 'ERROR from ' log && [ -s "$1" ]; }; get INSTALL_SHA256SUMS && get install.sh || { echo 'Installer download failed.' >&2; exit 1; }; [ "$(wc -l <INSTALL_SHA256SUMS)" -eq 1 ] && grep -Eqx '[0-9a-f]{64}  install\.sh' INSTALL_SHA256SUMS && sha256sum -c INSTALL_SHA256SUMS || { echo 'Installer checksum mismatch.' >&2; exit 1; }; sh install.sh)
 ```
 
-Одна команда подходит для первой установки и последующих обновлений до последнего
-стабильного [релиза GitHub](https://github.com/klockky/spotiya/releases/latest).
-Вход в аккаунт, настройки, профили и дополнения сохраняются. При первой установке
-добавляются команда `spotiya` и автозапуск; при обновлении сохраняется состояние
+Команда открывает интерактивное меню: установка или обновление до последнего
+стабильного [релиза GitHub](https://github.com/klockky/spotiya/releases/latest),
+проверка совместимости без установки и полное удаление. Выберите пункт цифрой
+и нажмите Enter; Enter без выбора или конец ввода отменяет действие.
+При установке и обновлении вход в аккаунт, настройки, профили и дополнения
+сохраняются. При первой установке добавляются команда `spotiya` и автозапуск;
+при обновлении сохраняется состояние
 службы. Во время загрузки команда выводит сообщение — дождитесь результата.
 
 После установки откройте интерфейс:
@@ -73,6 +76,28 @@ spotiya update
 
 Команда использует последний стабильный релиз из GitHub Releases. Если версия
 уже актуальна, переустановка и перезапуск приёмника не выполняются.
+
+### Удаление
+
+В root-терминале колонки выполните:
+
+```sh
+spotiya uninstall
+```
+
+Введите `uninstall` для подтверждения. Приёмник и дополнения остановятся;
+будут удалены автозапуск, команда `spotiya`, все дополнения, сохранённый вход,
+настройки, профили, бэкапы и журналы Spotiya. Штатная Алиса и её данные сохраняются.
+Если остановить процессы не удалось, файлы установки не удаляются.
+
+Для автоматизации: `spotiya uninstall --yes` (без запроса подтверждения).
+Полное удаление также доступно в меню быстрой настройки. Для старых версий без
+команды удаления установщик скачает текущий пакет и запустит из него удаление,
+не устанавливая его поверх старого.
+
+Скачанный `install.sh` без аргументов открывает меню. Для запуска без меню:
+`sh install.sh --install`, `sh install.sh --check` или
+`sh install.sh --uninstall --yes`.
 
 ### Через ПК
 

@@ -543,6 +543,194 @@ pub fn install(root: &Path, binary: &Path, newer_only: bool) -> io::Result<()> {
     Ok(())
 }
 
+fn confirm_uninstall(input: &mut impl io::BufRead, output: &mut impl Write) -> io::Result<bool> {
+    writeln!(
+        output,
+        "This removes Spotiya, its add-ons, saved login, settings and backups."
+    )?;
+    write!(output, "Type uninstall to confirm: ")?;
+    output.flush()?;
+    let mut answer = String::new();
+    input.read_line(&mut answer)?;
+    Ok(answer.trim() == "uninstall")
+}
+
+fn remove_path(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn managed_process(base: &Path, pid: u32) -> bool {
+    if pid == std::process::id() {
+        return false;
+    }
+    fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|exe| exe.starts_with(base))
+}
+
+/// Also finds orphaned add-ons after a forced receiver exit. Never signal by process name.
+fn managed_processes(base: &Path) -> io::Result<Vec<u32>> {
+    let mut pids = vec![];
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        if let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse().ok())
+            && managed_process(base, pid)
+        {
+            pids.push(pid);
+        }
+    }
+    Ok(pids)
+}
+
+fn stop_remaining_processes(base: &Path) -> io::Result<()> {
+    let base = fs::canonicalize(base)?;
+    for (signal, wait) in [(libc::SIGTERM, 3), (libc::SIGKILL, 2)] {
+        let pids = managed_processes(&base)?;
+        for pid in pids {
+            if managed_process(&base, pid) && unsafe { libc::kill(pid as i32, signal) } != 0 {
+                let e = io::Error::last_os_error();
+                if e.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(e);
+                }
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(wait);
+        loop {
+            if managed_processes(&base)?.is_empty() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    Err(error(
+        "Spotiya processes did not stop; no files were removed",
+    ))
+}
+
+fn uninstall_files(
+    layout: &Layout,
+    runtime: &[PathBuf],
+    stop: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    if !fs::symlink_metadata(&layout.base)?.is_dir() {
+        return Err(error("Installation directory is not a regular directory"));
+    }
+    // Do not remove a replacement CLI or service belonging to another application.
+    if fs::symlink_metadata(&layout.cli).is_ok()
+        && fs::read_link(&layout.cli).ok().as_ref() != Some(&layout.base.join("cli.sh"))
+    {
+        return Err(error(format!(
+            "{} belongs to another installation",
+            layout.cli.display()
+        )));
+    }
+    if let Ok(meta) = fs::symlink_metadata(&layout.init) {
+        let expected = fs::read(layout.base.join("S99spotify-connect"))
+            .unwrap_or_else(|_| include_bytes!("../packaging/S99spotify-connect").to_vec());
+        if !meta.is_file() || fs::read(&layout.init)? != expected {
+            return Err(error(
+                "Init script belongs to another installation or was modified",
+            ));
+        }
+    }
+    let state = layout.base.join("receiver-state");
+    let _install = crate::file_lock(&state, "install.lock")
+        .map_err(|_| error("Another installation is running"))?;
+    let _selection = crate::file_lock(&state, "profile-selection.lock")?;
+    stop().map_err(|e| error(format!("Uninstall aborted: {e}")))?;
+    // A manually started receiver must not survive removal or race the service stop.
+    let _supervisor = crate::file_lock(&state, "supervisor.lock")?;
+    let _receiver = crate::file_lock(&state, "receiver.lock")?;
+    for path in [&layout.init, &layout.cli].into_iter().chain(runtime) {
+        remove_path(path)
+            .map_err(|e| error(format!("Could not remove {}: {e}", path.display())))?;
+    }
+    remove_path(&layout.base)
+        .map_err(|e| error(format!("Could not remove {}: {e}", layout.base.display())))
+}
+
+pub fn uninstall(assume_yes: bool) -> io::Result<()> {
+    use io::IsTerminal;
+    if !cfg!(target_arch = "arm") {
+        return Err(error("Uninstall Spotiya on the ARM station"));
+    }
+    if unsafe { libc::geteuid() } != 0 {
+        return Err(error("Run the uninstaller as root on the speaker"));
+    }
+    let layout = Layout::system();
+    if !layout.base.exists() {
+        println!("Spotiya is not installed.");
+        return Ok(());
+    }
+    if !assume_yes {
+        if !io::stdin().is_terminal() {
+            return Err(error(
+                "Uninstall needs an interactive terminal; use --uninstall --yes to confirm",
+            ));
+        }
+        if !confirm_uninstall(&mut io::stdin().lock(), &mut io::stdout().lock())? {
+            println!("Cancelled; nothing changed.");
+            return Ok(());
+        }
+    }
+    let mut runtime: Vec<PathBuf> = [
+        RECEIVER_PID,
+        SUPERVISOR_PID,
+        crate::control::STATUS,
+        "/run/spotiya.status.new",
+        crate::voice::CONTROL,
+        "/run/spotiya-airplay",
+        "/run/spotiya-youtube.control",
+        "/run/spotiya-youtube.levels",
+        "/run/spotify-connect-stop",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect();
+    for log in [
+        crate::supervisor::LOG,
+        "/tmp/spotify-connect-supervisor.log",
+        "/tmp/spotiya-airplay.log",
+        "/tmp/spotiya-youtube.log",
+    ] {
+        runtime.push(log.into());
+        runtime.push(format!("{log}.1").into());
+        runtime.push(format!("{log}.1.new").into());
+    }
+    let mut mount = RootMount::writable()?;
+    let result = uninstall_files(&layout, &runtime, || {
+        if layout.init.exists() {
+            service("stop")?;
+        } else if layout.base.join("stop.sh").exists() {
+            let output = command(
+                Path::new("/bin/sh"),
+                &[layout.base.join("stop.sh").as_os_str()],
+                Duration::from_secs(12),
+            )?;
+            if !output.status.success() {
+                return Err(error("Receiver stop failed"));
+            }
+        }
+        stop_remaining_processes(&layout.base)
+    });
+    match (result, mount.restore()) {
+        (Ok(()), Ok(())) => {}
+        (Ok(()), Err(e)) => {
+            eprintln!("Warning: {e}; root filesystem stays writable until reboot");
+        }
+        (Err(e), Ok(())) => return Err(e),
+        (Err(e), Err(remount)) => return Err(error(format!("{e}. Also: {remount}"))),
+    }
+    println!("Spotiya uninstalled; add-ons, saved login, settings and backups removed.");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -611,6 +799,126 @@ mod tests {
         )
         .unwrap();
         (temp, layout, root)
+    }
+    fn uninstall_fixture() -> (Temporary, Layout, PathBuf) {
+        let fixture = fixture();
+        fs::write(
+            &fixture.1.init,
+            include_bytes!("../packaging/S99spotify-connect"),
+        )
+        .unwrap();
+        fixture
+    }
+    #[test]
+    fn uninstall_requires_the_explicit_confirmation_word() {
+        for answer in ["", "\n", "yes\n", "UNINSTALL\n", "uninstall\n"] {
+            let mut input = io::Cursor::new(answer);
+            let mut output = vec![];
+            assert_eq!(
+                confirm_uninstall(&mut input, &mut output).unwrap(),
+                answer == "uninstall\n"
+            );
+            assert!(String::from_utf8(output).unwrap().contains("saved login"));
+        }
+    }
+    #[test]
+    fn uninstall_removes_the_owned_installation_and_runtime_but_not_other_files() {
+        let (temp, layout, _root) = uninstall_fixture();
+        fs::create_dir_all(layout.base.join("airplay/bin")).unwrap();
+        fs::write(layout.base.join("airplay/bin/addon"), b"helper").unwrap();
+        fs::create_dir_all(layout.base.join("backups/old")).unwrap();
+        let outside = temp.0.join("quasar.cfg");
+        fs::write(&outside, b"factory settings").unwrap();
+        symlink(&outside, layout.base.join("outside-link")).unwrap();
+        let runtime = temp.0.join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        fs::write(runtime.join("log"), b"log").unwrap();
+        let mut stopped = false;
+        uninstall_files(&layout, std::slice::from_ref(&runtime), || {
+            stopped = true;
+            assert!(layout.base.join("spotiya").exists());
+            assert!(layout.init.exists());
+            Ok(())
+        })
+        .unwrap();
+        assert!(stopped);
+        assert!(!layout.base.exists() && !layout.init.exists());
+        assert!(fs::symlink_metadata(layout.cli).is_err());
+        assert!(!runtime.exists());
+        assert_eq!(fs::read(outside).unwrap(), b"factory settings");
+    }
+    #[test]
+    fn failed_uninstall_stop_keeps_files_credentials_and_service() {
+        let (_temp, layout, _root) = uninstall_fixture();
+        let message = uninstall_files(&layout, &[], || Err(error("fixture stop failed")))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("Uninstall aborted: fixture stop failed"));
+        assert_eq!(fs::read(layout.base.join("spotiya")).unwrap(), b"old");
+        assert!(layout.base.join("receiver-state/credentials.json").exists());
+        assert!(layout.init.exists() && layout.cli.exists());
+    }
+    #[test]
+    fn uninstall_refuses_a_foreign_cli_service_and_an_existing_install_lock() {
+        let (_temp, layout, _root) = uninstall_fixture();
+        fs::remove_file(&layout.cli).unwrap();
+        fs::write(&layout.cli, b"other application").unwrap();
+        assert!(
+            uninstall_files(&layout, &[], || panic!("must not stop"))
+                .unwrap_err()
+                .to_string()
+                .contains("belongs to another installation")
+        );
+        fs::remove_file(&layout.cli).unwrap();
+        symlink(layout.base.join("cli.sh"), &layout.cli).unwrap();
+        fs::write(&layout.init, b"other service").unwrap();
+        assert!(
+            uninstall_files(&layout, &[], || panic!("must not stop"))
+                .unwrap_err()
+                .to_string()
+                .contains("Init script belongs to another installation")
+        );
+        fs::write(
+            &layout.init,
+            include_bytes!("../packaging/S99spotify-connect"),
+        )
+        .unwrap();
+        let _lock = crate::file_lock(&layout.base.join("receiver-state"), "install.lock").unwrap();
+        assert!(
+            uninstall_files(&layout, &[], || panic!("must not stop"))
+                .unwrap_err()
+                .to_string()
+                .contains("Another installation is running")
+        );
+        assert!(layout.base.join("receiver-state/credentials.json").exists());
+    }
+    #[test]
+    fn uninstall_stops_orphaned_helpers_only_from_its_own_directory() {
+        let temp = Temporary::new(&std::env::temp_dir(), "spotiya-uninstall-process-test").unwrap();
+        let base = temp.0.join("installed");
+        fs::create_dir(&base).unwrap();
+        let helper = base.join("helper");
+        assert!(
+            command(
+                Path::new("/bin/cp"),
+                &[OsStr::new("/bin/sleep"), helper.as_os_str()],
+                Duration::from_secs(5)
+            )
+            .unwrap()
+            .status
+            .success()
+        );
+        let mut child = Command::new(helper).arg("30").spawn().unwrap();
+        let mut other = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let result = stop_remaining_processes(&base);
+        let child_exited = child.try_wait().unwrap().is_some();
+        let other_running = other.try_wait().unwrap().is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = other.kill();
+        let _ = other.wait();
+        result.unwrap();
+        assert!(child_exited && other_running);
     }
     #[test]
     fn failed_start_restores_binary_scripts_and_profiles_and_recovers() {

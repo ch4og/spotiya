@@ -1,18 +1,57 @@
 #!/bin/sh
 set -eu
 
-SPOTIYA_MODE=install
-case "${1:-}" in
-    --check) SPOTIYA_MODE=check; shift ;;
-    --help|-h)
-        echo 'Usage: sh install.sh [--check]'
-        echo 'Install or update to the latest stable Spotiya, or check without making changes.'
-        exit 0
-        ;;
-esac
-[ "$#" -eq 0 ] || { echo 'Usage: sh install.sh [--check]' >&2; exit 1; }
 fail() { echo "spotiya: $*" >&2; exit 1; }
+usage() { echo 'Usage: sh install.sh [--install | --check | --uninstall [--yes]]'; }
+SPOTIYA_MODE=menu
+SPOTIYA_YES=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --install|--check|--uninstall)
+            [ "$SPOTIYA_MODE" = menu ] || fail 'Choose one operation.'
+            SPOTIYA_MODE=${1#--}
+            ;;
+        --yes) SPOTIYA_YES=--yes ;;
+        --help|-h) usage; echo 'Without arguments, open the install/update, check and uninstall menu.'; exit 0 ;;
+        *) usage >&2; exit 1 ;;
+    esac
+    shift
+done
+[ -z "$SPOTIYA_YES" ] || [ "$SPOTIYA_MODE" = uninstall ] || fail '--yes requires --uninstall.'
 [ "$(id -u)" -eq 0 ] || fail 'Run this installer as root on the speaker.'
+SPOTIYA_BASE=/data/opt/spotify-connect
+if [ "$SPOTIYA_MODE" = menu ]; then
+    echo 'Spotiya setup'
+    echo '  1) Install or update to the latest stable release'
+    echo '  2) Check download and compatibility without installing'
+    echo '  3) Uninstall Spotiya and all its data'
+    echo '  0) Exit'
+    while :; do
+        printf 'Choose [0]: '
+        IFS= read -r SPOTIYA_CHOICE || SPOTIYA_CHOICE=0
+        case "$SPOTIYA_CHOICE" in
+            1) SPOTIYA_MODE=install; break ;;
+            2) SPOTIYA_MODE=check; break ;;
+            3) SPOTIYA_MODE=uninstall; break ;;
+            0|'') echo 'Cancelled; nothing changed.'; exit 0 ;;
+            *) echo 'Enter 0, 1, 2 or 3.' ;;
+        esac
+    done
+fi
+if [ "$SPOTIYA_MODE" = install ] && [ -x "$SPOTIYA_BASE/spotiya" ]; then
+    echo 'Spotiya is installed; checking for updates...'
+    exec "$SPOTIYA_BASE/spotiya" --update
+fi
+if [ "$SPOTIYA_MODE" = uninstall ]; then
+    [ -d "$SPOTIYA_BASE" ] || { echo 'Spotiya is not installed.'; exit 0; }
+    if [ -x "$SPOTIYA_BASE/spotiya" ] && "$SPOTIYA_BASE/spotiya" --help | grep -q -- '--uninstall'; then
+        # The binary owns service shutdown, locking and removal. Do not duplicate it here.
+        set -- --uninstall
+        [ -z "$SPOTIYA_YES" ] || set -- "$@" --yes
+        exec "$SPOTIYA_BASE/spotiya" "$@"
+    fi
+    echo 'Downloading a current uninstaller for this older installation...'
+fi
 for SPOTIYA_TOOL in uname od tr sha256sum gzip tar mktemp df awk grep mv; do
     command -v "$SPOTIYA_TOOL" >/dev/null 2>&1 || fail "Required command not found: $SPOTIYA_TOOL"
 done
@@ -23,12 +62,6 @@ esac
 if [ "$(od -An -tx1 -j4 -N2 /bin/sh | tr -d ' \n')" != 0101 ] ||
     [ "$(od -An -tx1 -j18 -N2 /bin/sh | tr -d ' \n')" != 2800 ]; then
     fail 'This package requires a little-endian ARM32 userspace.'
-fi
-
-SPOTIYA_BASE=/data/opt/spotify-connect
-if [ "$SPOTIYA_MODE" = install ] && [ -x "$SPOTIYA_BASE/spotiya" ]; then
-    echo 'Spotiya is installed; checking for updates...'
-    exec "$SPOTIYA_BASE/spotiya" --update
 fi
 
 SPOTIYA_MAIND=/system/vendor/quasar/maind
@@ -78,6 +111,12 @@ rm "$SPOTIYA_WORK/package.tar"
 "$SPOTIYA_WORK/spotiya/spotiya" --version || fail 'The release binary cannot run on this firmware.'
 if [ "$SPOTIYA_MODE" = check ]; then
     echo 'GitHub HTTPS download, checksum and ARM compatibility checks passed. Nothing installed.'
+    exit 0
+fi
+if [ "$SPOTIYA_MODE" = uninstall ]; then
+    set -- --uninstall
+    [ -z "$SPOTIYA_YES" ] || set -- "$@" --yes
+    "$SPOTIYA_WORK/spotiya/spotiya" "$@"
     exit 0
 fi
 sh "$SPOTIYA_WORK/spotiya/scripts/install.sh"

@@ -286,6 +286,8 @@ fn options() -> Result<Option<Options>, String> {
     let mut update_file = None;
     let mut install_root = None;
     let mut install_binary = None;
+    let mut uninstall = false;
+    let mut assume_yes = false;
     let mut addon_install = None;
     let mut addon_files = None;
     let mut addon_remove = None;
@@ -330,6 +332,8 @@ fn options() -> Result<Option<Options>, String> {
                 });
             }
             "--update" => update = true,
+            "--uninstall" => uninstall = true,
+            "--yes" => assume_yes = true,
             "--update-check" => {
                 update = true;
                 update_check = true;
@@ -431,16 +435,20 @@ fn options() -> Result<Option<Options>, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "spotiya [--state-dir PATH] [--name NAME] [--profile auto|mini1|mini2|generic|FILE] [--no-buttons] [--no-voice]\nspotiya --profiles | --profile-info | --profile-select ID_OR_JSON\nspotiya --tui | --addons | --login | --status | --version\nspotiya --doctor | --doctor-report PATH\nspotiya --update | --update-check | --update-tag VERSION\nspotiya --update-file ARCHIVE SHA256SUMS\nspotiya --addon-install ID | --addon-install-file ID ARCHIVE SHA256SUMS | --addon-remove ID\nspotiya --play QUERY | --resume | --pause | --toggle | --next | --previous\nspotiya --volume 0..100 | --voice on/off | --spectrum on/off | --airplay on/off | --youtube on/off | --release | --retry\nspotiya --youtube-url LINK"
+                    "spotiya [--state-dir PATH] [--name NAME] [--profile auto|mini1|mini2|generic|FILE] [--no-buttons] [--no-voice]\nspotiya --profiles | --profile-info | --profile-select ID_OR_JSON\nspotiya --tui | --addons | --login | --status | --version\nspotiya --doctor | --doctor-report PATH\nspotiya --update | --update-check | --update-tag VERSION\nspotiya --uninstall [--yes]\nspotiya --update-file ARCHIVE SHA256SUMS\nspotiya --addon-install ID | --addon-install-file ID ARCHIVE SHA256SUMS | --addon-remove ID\nspotiya --play QUERY | --resume | --pause | --toggle | --next | --previous\nspotiya --volume 0..100 | --voice on/off | --spectrum on/off | --airplay on/off | --youtube on/off | --release | --retry\nspotiya --youtube-url LINK"
                 );
                 return Ok(None);
             }
             _ => return Err(format!("unknown option: {arg}")),
         }
     }
+    if assume_yes && !uninstall {
+        return Err("--yes requires --uninstall".into());
+    }
     if [
         doctor,
         update,
+        uninstall,
         addon_install.is_some(),
         addon_remove.is_some(),
         install_root.is_some(),
@@ -454,6 +462,10 @@ fn options() -> Result<Option<Options>, String> {
         > 1
     {
         return Err("Choose one maintenance operation per command".into());
+    }
+    if uninstall {
+        installation::uninstall(assume_yes).map_err(|e| e.to_string())?;
+        return Ok(None);
     }
     if doctor {
         doctor::run(&result.state_dir, doctor_report.as_deref()).map_err(|e| e.to_string())?;

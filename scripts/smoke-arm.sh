@@ -27,6 +27,17 @@ run --version
 expect "spotiya $SPOTIYA_VERSION "
 run --help
 expect 'spotiya --play QUERY'
+expect 'spotiya --uninstall [--yes]'
+if run --uninstall --update; then
+    echo 'Smoke test: uninstall was accepted together with update' >&2
+    exit 1
+fi
+expect 'Choose one maintenance operation per command'
+if run --yes; then
+    echo 'Smoke test: --yes was accepted without uninstall' >&2
+    exit 1
+fi
+expect '--yes requires --uninstall'
 run --profiles
 expect 'mini1 '
 expect 'mini2 '

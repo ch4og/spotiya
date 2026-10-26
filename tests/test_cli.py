@@ -10,6 +10,26 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class MaintenanceCLI(unittest.TestCase):
+    def test_station_uninstall_wrapper_never_starts_receiver_and_rejects_extra_arguments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            binary = directory / "spotiya"
+            binary.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\"\n")
+            binary.chmod(0o700)
+            start = directory / "start.sh"
+            start.write_text("#!/bin/sh\nexit 99\n")
+            start.chmod(0o700)
+            wrapper = directory / "cli.sh"
+            wrapper.write_text((ROOT / "packaging/cli.sh").read_text().replace("/data/opt/spotify-connect", str(directory)))
+            for values in ([], ["--yes"]):
+                result = subprocess.run(["sh", str(wrapper), "uninstall"] + values, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines(), ["--uninstall"] + values)
+            result = subprocess.run(["sh", str(wrapper), "uninstall", "unexpected"], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Usage", result.stderr)
+            self.assertEqual(result.stdout, "")
+
     def test_youtube_toggles_or_plays_a_link_as_one_argument(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
@@ -49,6 +69,7 @@ class MaintenanceCLI(unittest.TestCase):
                 (["addon", "remove", "airplay"], ["--addon-remove", "airplay"]),
                 (["addon", "file", "airplay", path, "/tmp/AIRPLAY_SHA256SUMS"], ["--addon-install-file", "airplay", path, "/tmp/AIRPLAY_SHA256SUMS"]),
                 (["doctor"], ["--doctor"]),
+                (["uninstall", "--yes"], ["--uninstall", "--yes"]),
                 (["doctor", "report", path], ["--doctor-report", path]),
                 (["update", "check"], ["--update-check"]),
                 (["update", "v0.8.0"], ["--update-tag", "v0.8.0"]),
