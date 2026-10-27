@@ -294,7 +294,7 @@ fn collect(state: &Path) -> Report {
     report.status(pid, supervisor, status);
     match profiles::load(None,state) {
         Ok(resolved)=>{
-            report.profile=if matches!(resolved.profile.id.as_str(),"mini1"|"mini2"|"generic") { resolved.profile.id.clone() } else { "custom".into() };
+            report.profile=if matches!(resolved.profile.id.as_str(),"mini1"|"mini2"|"cucumber"|"generic") { resolved.profile.id.clone() } else { "custom".into() };
             report.add("Device profile","OK",format!("{}; buttons={}, ring={}, display={}, voice={}",report.profile,resolved.capabilities.buttons,resolved.capabilities.ring,resolved.capabilities.display,resolved.capabilities.voice));
             match mixer(&resolved.profile.audio) {
                 Ok((value,min,max,enabled))=>{

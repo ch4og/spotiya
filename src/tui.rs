@@ -1383,7 +1383,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("spotiya-menu-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
         let mut menu = ProfileMenu::new(&root, "auto").unwrap();
-        for key in b"\x1b[B\x1b[B\x1b[B" {
+        for key in b"\x1b[B\x1b[B\x1b[B\x1b[B" {
             assert!(menu.key(*key).is_none());
         }
         assert_eq!(menu.entries[menu.selected].key(), "generic");

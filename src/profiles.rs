@@ -9,6 +9,7 @@ use std::{
 
 const MINI1: &str = include_str!("../profiles/mini1.json");
 const MINI2: &str = include_str!("../profiles/mini2.json");
+const CUCUMBER: &str = include_str!("../profiles/cucumber.json");
 const GENERIC: &str = include_str!("../profiles/generic.json");
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -229,6 +230,7 @@ fn detect(root: &Path) -> &'static str {
         {
             Some("yandexmini") => return "mini1",
             Some("yandexmini_2") => return "mini2",
+            Some("cucumber") => return "cucumber",
             _ => {}
         }
     }
@@ -341,6 +343,7 @@ fn load_at(selection: &str, state_dir: &Path, root: &Path) -> io::Result<Resolve
     let profile = match selection {
         "mini1" => parse(MINI1)?,
         "mini2" => parse(MINI2)?,
+        "cucumber" => parse(CUCUMBER)?,
         "generic" => parse(GENERIC)?,
         path => read_file(Path::new(path))?,
     };
@@ -560,6 +563,24 @@ mod tests {
         fs::remove_file(rooted(&f.0, "/sys/class/leds/mini2:blue:ring6/brightness")).unwrap();
         assert!(!f.load("auto").unwrap().capabilities.ring);
         assert!(!f.load("generic").unwrap().capabilities.controls());
+    }
+    #[test]
+    fn cucumber_uses_quasar_without_controls() {
+        let f = Fixture::new();
+        f.file(
+            "/system/vendor/quasar/quasar.cfg",
+            br#"{"common":{"deviceType":"cucumber"}}"#,
+        );
+        let r = f.load("auto").unwrap();
+        assert_eq!(r.profile.id, "cucumber");
+        assert_eq!(r.profile.audio.device, "default");
+        assert_eq!(r.profile.audio.mixer_control, "Master");
+        assert_eq!(
+            r.profile.voice.unwrap().address,
+            "127.0.0.1:9875".parse().unwrap()
+        );
+        assert!(r.capabilities.voice);
+        assert!(!r.capabilities.controls());
     }
     #[test]
     fn saved_custom_profile_overrides_detection_and_survives_explicit_selection() {
